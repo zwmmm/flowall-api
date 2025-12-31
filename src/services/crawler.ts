@@ -7,13 +7,16 @@ export class CrawlerService {
   private readonly AI_BASE_URL: string // Gemini API 基础 URL (支持代理)
   private readonly AI_MODEL: string // 使用的模型名称
   private currentKeyIndex = 0 // 当前使用的 key 索引
-  private readonly REQUEST_DELAY = 2000 // 请求间隔 2s
+
+  // 全局任务限速 (1秒/任务)
+  private lastTaskTime = 0
+  private readonly TASK_INTERVAL = 1000 // 1秒执行一次任务
+
   private readonly MOBILE_UA =
     'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
 
   // 队列配置
   private readonly CONSUMER_COUNT = 3 // 并发消费者数量
-  private readonly BATCH_INSERT_SIZE = 10 // 批量插入大小
 
   // 终止信号
   private abortController: AbortController | null = null
@@ -112,7 +115,6 @@ export class CrawlerService {
     const stats = { newCount: 0, updatedCount: 0, failedCount: 0, skippedCount: 0 }
     const urlQueue: string[] = [] // URL 队列
     let producerDone = false // 生产者是否完成
-    const processedBatch: MoewallsRawData[] = [] // 待插入批次
 
     // 创建爬取日志记录
     const { data: logEntry, error: logError } = await supabase
@@ -161,7 +163,7 @@ export class CrawlerService {
             }
 
             page++
-            await this.delay(this.REQUEST_DELAY)
+            await this.delay(2000) // 生产者爬取列表页间隔 2 秒
           } catch (error) {
             console.error(`❌ [生产者] 第 ${page} 页失败:`, error)
             emptyCount++
@@ -205,6 +207,9 @@ export class CrawlerService {
           processedCount++
 
           try {
+            // 全局任务限速: 1 秒执行一次 (所有消费者共享)
+            await this.throttleTask()
+
             // 1. 提取 ID
             const urlParts = url.replace(/\/$/, '').split('/')
             const moewallsId = urlParts[urlParts.length - 1]
@@ -222,22 +227,20 @@ export class CrawlerService {
               continue
             }
 
-            // 3. 爬取详情页
+            // 3. 爬取详情页并立即处理
             console.log(`🔍 [消费者${id}] 开始爬取: ${moewallsId}`)
             const wallpaper = await this.fetchDetailPage(url)
-            processedBatch.push(wallpaper)
+
+            // 4. 立即处理并插入数据库
+            console.log(`💾 [消费者${id}] 处理并插入: ${wallpaper.name}`)
+            const result = await this.processWallpaper(wallpaper)
+
+            if (result === 'new') stats.newCount++
+            if (result === 'updated') stats.updatedCount++
 
             console.log(
-              `✅ [消费者${id}] 爬取成功: ${wallpaper.name} (待插入: ${processedBatch.length}, 已处理: ${processedCount})`,
+              `✅ [消费者${id}] 完成: ${wallpaper.name} (${result}) - 已处理: ${processedCount}, 统计: 新增 ${stats.newCount}, 更新 ${stats.updatedCount}, 跳过 ${stats.skippedCount}`,
             )
-
-            // 4. 批量插入数据库
-            if (processedBatch.length >= this.BATCH_INSERT_SIZE) {
-              console.log(`💾 [消费者${id}] 触发批量插入 (${processedBatch.length} 条)`)
-              await this.batchInsert(processedBatch, stats)
-            }
-
-            await this.delay(this.REQUEST_DELAY)
           } catch (error) {
             stats.failedCount++
             console.error(`❌ [消费者${id}] 处理失败 (已处理: ${processedCount}):`, error)
@@ -256,13 +259,6 @@ export class CrawlerService {
 
       console.log(`📊 [爬虫] 生产者和所有消费者已完成`)
       console.log(`📊 [队列状态] 剩余 URL: ${urlQueue.length}`)
-      console.log(`📊 [批次状态] 待插入: ${processedBatch.length}`)
-
-      // 插入剩余数据
-      if (processedBatch.length > 0) {
-        console.log(`💾 [最终批次] 插入剩余 ${processedBatch.length} 条数据`)
-        await this.batchInsert(processedBatch, stats)
-      }
 
       const statusMsg = this.abortController?.signal.aborted ? '\n🛑 爬取已终止' : '\n🎉 爬取完成'
       console.log(
@@ -331,34 +327,6 @@ export class CrawlerService {
    */
   getStatus(): { isRunning: boolean } {
     return { isRunning: this.isRunning }
-  }
-
-  /**
-   * 批量插入数据到数据库
-   */
-  private async batchInsert(
-    batch: MoewallsRawData[],
-    stats: { newCount: number; updatedCount: number; failedCount: number },
-  ) {
-    console.log(`💾 [批量插入] 开始插入 ${batch.length} 条数据...`)
-
-    const batchCopy = [...batch]
-    batch.length = 0 // 清空原数组
-
-    for (const raw of batchCopy) {
-      try {
-        const result = await this.processWallpaper(raw)
-        if (result === 'new') stats.newCount++
-        if (result === 'updated') stats.updatedCount++
-      } catch (error) {
-        stats.failedCount++
-        console.error('❌ [批量插入] 处理失败:', error)
-      }
-    }
-
-    console.log(
-      `✅ [批量插入] 完成 (新增: ${stats.newCount}, 更新: ${stats.updatedCount}, 失败: ${stats.failedCount})`,
-    )
   }
 
   /**
@@ -714,6 +682,21 @@ export class CrawlerService {
    */
   private delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
+  }
+
+  /**
+   * 全局任务限速: 确保任务间隔至少 1 秒 (所有消费者共享)
+   */
+  private async throttleTask(): Promise<void> {
+    const now = Date.now()
+    const timeSinceLastTask = now - this.lastTaskTime
+
+    if (timeSinceLastTask < this.TASK_INTERVAL) {
+      const waitTime = this.TASK_INTERVAL - timeSinceLastTask
+      await this.delay(waitTime)
+    }
+
+    this.lastTaskTime = Date.now()
   }
 
   /**
