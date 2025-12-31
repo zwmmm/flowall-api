@@ -556,6 +556,7 @@ export class CrawlerService {
   /**
    * 生成 AI 内容 (描述 + 中文翻译) - 合并为一次调用
    * 返回结构化 JSON 数据
+   * 支持多 Key 重试机制
    */
   private async generateAIContent(
     name: string,
@@ -578,16 +579,7 @@ export class CrawlerService {
       return fallback
     }
 
-    try {
-      await this.throttleAiRequest()
-
-      const apiKey = this.getNextApiKey()
-      if (!apiKey) {
-        console.log('⚠️ 无可用的 API Key (全部熔断中)')
-        return fallback
-      }
-
-      const prompt = `你是一个专业的壁纸描述生成助手。请根据以下壁纸信息生成中文内容：
+    const prompt = `你是一个专业的壁纸描述生成助手。请根据以下壁纸信息生成中文内容：
 
 原始标题: ${name}
 标签: ${tags.join(', ')}
@@ -604,57 +596,84 @@ export class CrawlerService {
 2. description: 生动形象的描述，吸引用户
 3. tags_zh: 准确翻译所有标签`
 
-      const response = await fetch(
-        `${this.AI_BASE_URL}/models/${this.AI_MODEL}:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{
-              parts: [{ text: prompt }],
-            }],
-            generationConfig: {
-              temperature: 0.7,
-              maxOutputTokens: 500,
-            },
-          }),
-        },
-      )
+    // 重试逻辑: 最多尝试所有可用的 API Keys
+    let lastError: Error | null = null
 
-      if (!response.ok) {
-        const errorText = await response.text()
-        console.error(`❌ AI API 错误 (${response.status}): ${errorText}`)
+    for (let attempt = 0; attempt < this.AI_API_KEYS.length; attempt++) {
+      try {
+        await this.throttleAiRequest()
 
-        // 触发熔断 (429: 配额超限, 403: API Key 无效)
-        if (response.status === 429 || response.status === 403) {
-          this.circuitBreakKey(apiKey)
+        const apiKey = this.getNextApiKey()
+        if (!apiKey) {
+          console.log('⚠️ 无可用的 API Key (全部熔断中)')
+          break
         }
 
-        throw new Error(`API error: ${response.status}`)
-      }
+        const response = await fetch(
+          `${this.AI_BASE_URL}/models/${this.AI_MODEL}:generateContent?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{
+                parts: [{ text: prompt }],
+              }],
+              generationConfig: {
+                temperature: 0.7,
+                maxOutputTokens: 500,
+              },
+            }),
+          },
+        )
 
-      const data = await response.json()
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim()
+        if (!response.ok) {
+          const errorText = await response.text()
+          console.error(
+            `❌ [尝试 ${attempt + 1}/${this.AI_API_KEYS.length}] AI API 错误 (${response.status}): ${errorText}`,
+          )
 
-      if (text) {
-        // 清理可能的 markdown 代码块标记
-        const cleanedText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
-        const result = JSON.parse(cleanedText)
+          // 触发熔断 (429: 配额超限, 403: API Key 无效, 500: 服务器错误)
+          if (response.status === 429 || response.status === 403 || response.status === 500) {
+            this.circuitBreakKey(apiKey)
+          }
 
-        console.log(`✅ AI 内容生成成功: ${name} → ${result.name_zh}`)
-
-        return {
-          description: result.description || fallback.description,
-          name_zh: result.name_zh,
-          tags_zh: Array.isArray(result.tags_zh) ? result.tags_zh : undefined,
+          lastError = new Error(`API error: ${response.status}`)
+          continue // 尝试下一个 Key
         }
-      }
 
-      return fallback
-    } catch (error) {
-      console.error('❌ AI 内容生成失败:', error)
-      return fallback
+        const data = await response.json()
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim()
+
+        if (text) {
+          // 清理可能的 markdown 代码块标记
+          const cleanedText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
+          const result = JSON.parse(cleanedText)
+
+          console.log(
+            `✅ [尝试 ${attempt + 1}/${this.AI_API_KEYS.length}] AI 内容生成成功: ${name} → ${result.name_zh}`,
+          )
+
+          return {
+            description: result.description || fallback.description,
+            name_zh: result.name_zh,
+            tags_zh: Array.isArray(result.tags_zh) ? result.tags_zh : undefined,
+          }
+        }
+
+        // 响应成功但无内容，尝试下一个 Key
+        console.warn(`⚠️ [尝试 ${attempt + 1}/${this.AI_API_KEYS.length}] AI 返回空内容`)
+        lastError = new Error('Empty response from AI')
+        continue
+      } catch (error) {
+        console.error(`❌ [尝试 ${attempt + 1}/${this.AI_API_KEYS.length}] AI 内容生成失败:`, error)
+        lastError = error instanceof Error ? error : new Error(String(error))
+        continue // 尝试下一个 Key
+      }
     }
+
+    // 所有 Key 都尝试失败
+    console.error(`❌ 所有 API Keys 尝试失败 (共 ${this.AI_API_KEYS.length} 个), 使用降级策略`, lastError)
+    return fallback
   }
 
   /**
