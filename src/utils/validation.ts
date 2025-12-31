@@ -56,20 +56,9 @@ export const paginationSchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
 })
 
-// 排序参数验证
-export const sortSchema = z.enum(['latest', 'popular', 'rating']).default('latest')
-
 // 搜索查询验证
 export const searchQuerySchema = z.string().max(100).transform((val: string) =>
   val.trim().replace(/[<>]/g, '')
-).optional()
-
-// 标签验证
-export const tagsSchema = z.string().transform((val: string) =>
-  val.split(',')
-    .map((tag: string) => tag.trim())
-    .filter((tag: string) => tag.length > 0 && tag.length <= 50)
-    .slice(0, 10)
 ).optional()
 
 /**
@@ -87,27 +76,10 @@ export function validatePagination(
 }
 
 /**
- * 验证排序参数
- */
-export function validateSort(sort?: string): 'latest' | 'popular' | 'rating' {
-  const result = sortSchema.safeParse(sort)
-  return result.success ? result.data : 'latest'
-}
-
-/**
  * 清洗搜索查询
  */
 export function sanitizeSearchQuery(query?: string): string {
   if (!query) return ''
   const result = searchQuerySchema.safeParse(query)
   return result.success ? result.data || '' : ''
-}
-
-/**
- * 清洗标签数组
- */
-export function sanitizeTags(tagsStr?: string): string[] {
-  if (!tagsStr) return []
-  const result = tagsSchema.safeParse(tagsStr)
-  return result.success ? result.data || [] : []
 }

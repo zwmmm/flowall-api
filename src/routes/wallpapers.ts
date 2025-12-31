@@ -1,13 +1,11 @@
 import { Hono } from 'hono'
 import { supabase } from '../../main.ts'
-import type { WallpaperWithTags } from '../types/wallpaper.ts'
+import type { Wallpaper } from '../types/wallpaper.ts'
 import {
   ApiError,
   globalRateLimiter,
   sanitizeSearchQuery,
-  sanitizeTags,
   validatePagination,
-  validateSort,
 } from '../utils/validation.ts'
 import { asyncHandler } from '../middleware/errorHandler.ts'
 
@@ -36,41 +34,21 @@ router.get(
     const { page, limit } = validatePagination(rawPage, rawLimit)
 
     const search = sanitizeSearchQuery(c.req.query('search'))
-    const tags = sanitizeTags(c.req.query('tags'))
-    const sort = validateSort(c.req.query('sort'))
 
     const offset = (page - 1) * limit
 
     // 构建查询
     let dbQuery = supabase
-      .from('wallpapers_with_tags')
+      .from('wallpapers')
       .select('*', { count: 'exact' })
       .eq('status', 'active')
 
-    // 搜索过滤
+    // 搜索过滤 (使用 search_vector 全文搜索)
     if (search) {
-      dbQuery = dbQuery.textSearch('description', search, {
+      dbQuery = dbQuery.textSearch('search_vector', search, {
         type: 'websearch',
         config: 'simple',
       })
-    }
-
-    // 标签过滤
-    if (tags.length > 0) {
-      dbQuery = dbQuery.contains('tags', tags)
-    }
-
-    // 排序
-    switch (sort) {
-      case 'latest':
-        dbQuery = dbQuery.order('crawled_at', { ascending: false })
-        break
-      case 'popular':
-        dbQuery = dbQuery.order('view_count', { ascending: false })
-        break
-      case 'rating':
-        dbQuery = dbQuery.order('rating', { ascending: false })
-        break
     }
 
     // 分页
@@ -86,7 +64,7 @@ router.get(
     return c.json({
       success: true,
       data: {
-        items: data as WallpaperWithTags[],
+        items: data as Wallpaper[],
         pagination: {
           page,
           limit,
@@ -106,10 +84,8 @@ router.get(
   asyncHandler(async (c) => {
     const id = c.req.param('id')
 
-    // 验证 UUID 格式
-
     const { data, error } = await supabase
-      .from('wallpapers_with_tags')
+      .from('wallpapers')
       .select('*')
       .eq('id', id)
       .eq('status', 'active')
@@ -122,67 +98,9 @@ router.get(
       throw new ApiError(500, '查询失败', 'DB_QUERY_ERROR')
     }
 
-    // 异步增加浏览量 (不阻塞响应)
-    Promise.resolve(
-      supabase
-        .from('wallpapers')
-        .update({ view_count: (data.view_count || 0) + 1 })
-        .eq('id', id),
-    ).catch(() => {
-      // 忽略错误,不影响主流程
-    })
-
     return c.json({
       success: true,
-      data: data as WallpaperWithTags,
-    })
-  }),
-)
-
-/**
- * 获取随机壁纸
- */
-router.get(
-  '/random',
-  asyncHandler(async (c) => {
-    const rawLimit = Number(c.req.query('limit')) || 1
-    const limit = Math.min(20, Math.max(1, Math.floor(rawLimit)))
-
-    const { data, error } = await supabase
-      .rpc('get_random_wallpapers', { limit_count: limit })
-
-    if (error) {
-      console.error('RPC 调用错误:', error)
-      throw new ApiError(500, '查询失败', 'DB_RPC_ERROR')
-    }
-
-    return c.json({
-      success: true,
-      data: data as WallpaperWithTags[],
-    })
-  }),
-)
-
-/**
- * 记录下载
- */
-router.post(
-  '/:id/download',
-  asyncHandler(async (c) => {
-    const id = c.req.param('id')
-
-    // 增加下载量
-    const { error } = await supabase.rpc('increment_download_count', {
-      wallpaper_id: id,
-    })
-
-    if (error) {
-      console.error('更新下载量失败:', error)
-    }
-
-    return c.json({
-      success: true,
-      message: '已记录',
+      data: data as Wallpaper,
     })
   }),
 )

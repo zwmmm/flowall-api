@@ -114,6 +114,24 @@ export class CrawlerService {
     let producerDone = false // 生产者是否完成
     const processedBatch: MoewallsRawData[] = [] // 待插入批次
 
+    // 创建爬取日志记录
+    const { data: logEntry, error: logError } = await supabase
+      .from('crawl_logs')
+      .insert({
+        status: 'success',
+        wallpapers_count: 0,
+        new_count: 0,
+        updated_count: 0,
+      })
+      .select('id')
+      .single()
+
+    const logId = logEntry?.id
+
+    if (logError) {
+      console.error('创建爬取日志失败:', logError)
+    }
+
     try {
       // 🔧 生产者: 持续爬取列表页,将 URL 放入队列
       const producer = (async () => {
@@ -237,11 +255,44 @@ export class CrawlerService {
         `${statusMsg}: 新增 ${stats.newCount}, 更新 ${stats.updatedCount}, 跳过 ${stats.skippedCount}, 失败 ${stats.failedCount}`,
       )
 
+      // 更新爬取日志
+      if (logId) {
+        const finalStatus = this.abortController?.signal.aborted
+          ? 'partial'
+          : stats.failedCount > 0
+          ? 'partial'
+          : 'success'
+
+        await supabase
+          .from('crawl_logs')
+          .update({
+            status: finalStatus,
+            wallpapers_count: stats.newCount + stats.updatedCount,
+            new_count: stats.newCount,
+            updated_count: stats.updatedCount,
+            completed_at: new Date().toISOString(),
+          })
+          .eq('id', logId)
+      }
+
       return {
         new_count: stats.newCount,
         updated_count: stats.updatedCount,
         failed_count: stats.failedCount,
       }
+    } catch (error) {
+      // 记录失败日志
+      if (logId) {
+        await supabase
+          .from('crawl_logs')
+          .update({
+            status: 'failed',
+            error_message: error instanceof Error ? error.message : String(error),
+            completed_at: new Date().toISOString(),
+          })
+          .eq('id', logId)
+      }
+      throw error
     } finally {
       this.isRunning = false
       this.abortController = null
@@ -447,7 +498,7 @@ export class CrawlerService {
     // 1. 检查是否已存在
     const { data: existing } = await supabase
       .from('wallpapers')
-      .select('id, description')
+      .select('id, description, name_zh, tags_zh')
       .eq('moewalls_id', raw.id)
       .single()
 
@@ -457,10 +508,21 @@ export class CrawlerService {
       description = await this.generateDescriptionWithRetry(raw.name, raw.tags)
     }
 
-    // 3. 准备数据
+    // 3. 翻译 name 和 tags (仅在不存在时翻译)
+    let name_zh = existing?.name_zh
+    let tags_zh = existing?.tags_zh
+
+    if (!name_zh || !tags_zh || tags_zh.length === 0) {
+      const translation = await this.translateContent(raw.name, raw.tags)
+      name_zh = translation.name_zh || name_zh
+      tags_zh = translation.tags_zh || tags_zh
+    }
+
+    // 4. 准备数据
     const wallpaperData: Partial<Wallpaper> = {
       moewalls_id: raw.id,
       name: raw.name,
+      name_zh,
       description,
       cover_url: raw.cover_url,
       preview_url: raw.preview_url,
@@ -491,8 +553,8 @@ export class CrawlerService {
       wallpaperId = data.id
     }
 
-    // 4. 处理标签
-    await this.processTags(wallpaperId, raw.tags)
+    // 5. 处理标签 (包含中文翻译)
+    await this.processTags(wallpaperId, raw.tags, tags_zh)
 
     return existing ? 'updated' : 'new'
   }
@@ -626,82 +688,87 @@ export class CrawlerService {
   }
 
   /**
-   * 处理标签 (批量优化)
+   * 处理标签: 直接更新 wallpapers 表的 tags 和 tags_zh 字段
    */
-  private async processTags(wallpaperId: string, tagNames: string[]) {
-    if (tagNames.length === 0) return
+  private async processTags(wallpaperId: string, tagNames: string[], tagsZh?: string[] | null) {
+    const { error } = await supabase
+      .from('wallpapers')
+      .update({
+        tags: tagNames,
+        tags_zh: tagsZh || []
+      })
+      .eq('id', wallpaperId)
 
-    const tagIds: string[] = []
-
-    // 批量获取已存在的标签
-    const slugs = tagNames.map((name) => this.slugify(name))
-    const { data: existingTags } = await supabase
-      .from('wallpaper_tags')
-      .select('id, slug')
-      .in('slug', slugs)
-
-    const existingMap = new Map(
-      existingTags?.map((t) => [t.slug, t.id]) || [],
-    )
-
-    // 确定需要创建的新标签
-    const newTags = tagNames
-      .map((name, idx) => ({ name, slug: slugs[idx] }))
-      .filter((t) => !existingMap.has(t.slug))
-
-    // 批量插入新标签
-    if (newTags.length > 0) {
-      const { data: createdTags, error } = await supabase
-        .from('wallpaper_tags')
-        .insert(newTags)
-        .select('id, slug')
-
-      if (error) {
-        console.error('批量创建标签失败:', error)
-      } else {
-        createdTags?.forEach((t) => existingMap.set(t.slug, t.id))
-      }
-    }
-
-    // 收集所有标签 ID
-    slugs.forEach((slug) => {
-      const id = existingMap.get(slug)
-      if (id) tagIds.push(id)
-    })
-
-    // 删除旧关联并创建新关联 (使用事务会更安全)
-    await supabase
-      .from('wallpaper_tag_relations')
-      .delete()
-      .eq('wallpaper_id', wallpaperId)
-
-    if (tagIds.length > 0) {
-      const relations = tagIds.map((tag_id) => ({
-        wallpaper_id: wallpaperId,
-        tag_id,
-      }))
-
-      const { error } = await supabase
-        .from('wallpaper_tag_relations')
-        .insert(relations)
-
-      if (error) {
-        console.error('创建标签关联失败:', error)
-      }
+    if (error) {
+      console.error('更新标签失败:', error)
     }
   }
 
   /**
-  /**
-   * 将字符串转为 URL 友好的 slug
+   * 翻译内容 (name 和 tags)
+   * 使用 Gemini API 进行翻译，失败时返回空
    */
-  private slugify(text: string): string {
-    return text
-      .toLowerCase()
-      .trim()
-      .replace(/[\s_]+/g, '-')
-      .replace(/[^\w\-\u4e00-\u9fa5]+/g, '')
-      .replace(/\-\-+/g, '-')
+  private async translateContent(
+    name: string,
+    tags: string[],
+  ): Promise<{ name_zh?: string; tags_zh?: string[] }> {
+    // 未配置 Gemini API Keys，跳过翻译
+    if (this.AI_API_KEYS.length === 0) {
+      console.log('⚠️ 未配置 AI API，跳过翻译')
+      return {}
+    }
+
+    try {
+      await this.throttleAiRequest()
+
+      const apiKey = this.AI_API_KEYS[this.currentKeyIndex]
+      const prompt = `请将以下英文内容翻译成简体中文，只返回翻译结果，不要任何解释：
+
+标题: ${name}
+标签: ${tags.join(', ')}
+
+请按照以下格式返回（每行一个）：
+标题翻译
+标签1,标签2,标签3`
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{
+              parts: [{ text: prompt }],
+            }],
+            generationConfig: {
+              temperature: 0.3,
+              maxOutputTokens: 200,
+            },
+          }),
+        },
+      )
+
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status}`)
+      }
+
+      const data = await response.json()
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim()
+
+      if (text) {
+        const lines = text.split('\n').filter((line: string) => line.trim())
+        const name_zh = lines[0]?.trim()
+        const tags_zh = lines[1]?.split(',').map((t: string) => t.trim()).filter((t: string) => t)
+
+        console.log(`✅ 翻译成功: ${name} → ${name_zh}`)
+        return { name_zh, tags_zh }
+      }
+
+      return {}
+    } catch (error) {
+      console.error('❌ 翻译失败:', error)
+      return {}
+    }
   }
 
   /**
