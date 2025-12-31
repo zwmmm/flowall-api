@@ -15,9 +15,6 @@ export class CrawlerService {
   private readonly MOBILE_UA =
     'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
 
-  // 队列配置
-  private readonly CONSUMER_COUNT = 3 // 并发消费者数量
-
   // 终止信号
   private abortController: AbortController | null = null
   private isRunning = false
@@ -101,7 +98,7 @@ export class CrawlerService {
   }
 
   /**
-   * 执行爬取任务 (生产者-消费者模式)
+   * 执行爬取任务 (串行模式)
    */
   async crawl(): Promise<{ new_count: number; updated_count: number; failed_count: number }> {
     if (this.isRunning) {
@@ -110,11 +107,9 @@ export class CrawlerService {
 
     this.isRunning = true
     this.abortController = new AbortController()
-    console.log('🕷️ 开始爬取 moewalls.com (生产者-消费者模式)...')
+    console.log('🕷️ 开始爬取 moewalls.com (串行模式)...')
 
     const stats = { newCount: 0, updatedCount: 0, failedCount: 0, skippedCount: 0 }
-    const urlQueue: string[] = [] // URL 队列
-    let producerDone = false // 生产者是否完成
 
     // 创建爬取日志记录
     const { data: logEntry, error: logError } = await supabase
@@ -135,130 +130,89 @@ export class CrawlerService {
     }
 
     try {
-      // 🔧 生产者: 持续爬取列表页,将 URL 放入队列
-      const producer = (async () => {
-        let page = 1
-        let emptyCount = 0 // 连续空页数
+      let page = 1
+      let emptyCount = 0 // 连续空页数
 
-        while (emptyCount < 3) { // 连续3页为空则停止
-          // 检查终止信号
-          if (this.abortController?.signal.aborted) {
-            console.log('🛑 [生产者] 检测到终止信号,停止爬取')
-            break
-          }
+      // 串行处理: 一页一页地爬取
+      while (emptyCount < 3) {
+        // 检查终止信号
+        if (this.abortController?.signal.aborted) {
+          console.log('🛑 检测到终止信号,停止爬取')
+          break
+        }
 
-          try {
-            console.log(`📄 [生产者] 爬取第 ${page} 页...`)
-            const urls = await this.fetchListPage(page)
+        try {
+          console.log(`📄 [第 ${page} 页] 开始爬取...`)
+          const urls = await this.fetchListPage(page)
 
-            if (urls.length === 0) {
-              emptyCount++
-              console.log(`⚠️ [生产者] 第 ${page} 页无数据 (连续空页: ${emptyCount}/3)`)
-            } else {
-              emptyCount = 0
-              urlQueue.push(...urls)
-              console.log(
-                `✅ [生产者] 第 ${page} 页获取 ${urls.length} 个URL (队列: ${urlQueue.length})`,
-              )
-            }
-
-            page++
-            await this.delay(2000) // 生产者爬取列表页间隔 2 秒
-          } catch (error) {
-            console.error(`❌ [生产者] 第 ${page} 页失败:`, error)
+          if (urls.length === 0) {
             emptyCount++
-          }
-        }
+            console.log(`⚠️ [第 ${page} 页] 无数据 (连续空页: ${emptyCount}/3)`)
+          } else {
+            emptyCount = 0
+            console.log(`✅ [第 ${page} 页] 获取 ${urls.length} 个URL`)
 
-        producerDone = true
-        console.log(
-          `🏁 [生产者] 完成,共收集 ${
-            urlQueue.length + stats.skippedCount + stats.newCount + stats.updatedCount
-          } 个URL`,
-        )
-      })()
+            // 处理当前页的所有 URL
+            for (let i = 0; i < urls.length; i++) {
+              // 检查终止信号
+              if (this.abortController?.signal.aborted) {
+                console.log('🛑 检测到终止信号,停止处理')
+                break
+              }
 
-      // 🔧 消费者: 从队列取 URL,爬取详情并处理
-      const createConsumer = async (id: number) => {
-        console.log(`🚀 [消费者${id}] 启动`)
-        let processedCount = 0
+              const url = urls[i]
 
-        while (true) {
-          // 检查终止信号
-          if (this.abortController?.signal.aborted) {
-            console.log(`🛑 [消费者${id}] 检测到终止信号,停止工作 (已处理: ${processedCount})`)
-            break
-          }
+              try {
+                // 提取 ID
+                const urlParts = url.replace(/\/$/, '').split('/')
+                const moewallsId = urlParts[urlParts.length - 1]
 
-          // 队列为空且生产者已完成,退出
-          if (urlQueue.length === 0 && producerDone) {
-            console.log(`🏁 [消费者${id}] 队列已空且生产者完成,退出 (已处理: ${processedCount})`)
-            break
-          }
+                // 查询数据库,已存在则跳过 (不等待)
+                const { data: existing } = await supabase
+                  .from('wallpapers')
+                  .select('id')
+                  .eq('moewalls_id', moewallsId)
+                  .maybeSingle()
 
-          // 队列为空但生产者未完成,等待
-          if (urlQueue.length === 0) {
-            console.log(`⏳ [消费者${id}] 队列为空,等待生产者... (生产者状态: ${producerDone ? '已完成' : '进行中'})`)
-            await this.delay(500)
-            continue
-          }
+                if (existing) {
+                  stats.skippedCount++
+                  console.log(`⏭️ [${i + 1}/${urls.length}] 已存在,跳过: ${moewallsId}`)
+                  continue // 跳过不等待
+                }
 
-          const url = urlQueue.shift()!
-          processedCount++
+                // 任务限速: 1 秒执行一次
+                await this.throttleTask()
 
-          try {
-            // 全局任务限速: 1 秒执行一次 (所有消费者共享)
-            await this.throttleTask()
+                // 爬取详情页并处理
+                console.log(`🔍 [${i + 1}/${urls.length}] 开始爬取: ${moewallsId}`)
+                const wallpaper = await this.fetchDetailPage(url)
 
-            // 1. 提取 ID
-            const urlParts = url.replace(/\/$/, '').split('/')
-            const moewallsId = urlParts[urlParts.length - 1]
+                console.log(`💾 [${i + 1}/${urls.length}] 处理并插入: ${wallpaper.name}`)
+                const result = await this.processWallpaper(wallpaper)
 
-            // 2. 查询数据库,已存在则跳过
-            const { data: existing } = await supabase
-              .from('wallpapers')
-              .select('id')
-              .eq('moewalls_id', moewallsId)
-              .maybeSingle()
+                if (result === 'new') stats.newCount++
+                if (result === 'updated') stats.updatedCount++
 
-            if (existing) {
-              stats.skippedCount++
-              console.log(`⏭️ [消费者${id}] 已存在,跳过: ${moewallsId} (已处理: ${processedCount})`)
-              continue
+                console.log(
+                  `✅ [${i + 1}/${urls.length}] 完成: ${wallpaper.name} (${result}) | 统计: +${stats.newCount} ↻${stats.updatedCount} ⊘${stats.skippedCount}`,
+                )
+              } catch (error) {
+                stats.failedCount++
+                console.error(`❌ [${i + 1}/${urls.length}] 处理失败:`, error)
+              }
             }
 
-            // 3. 爬取详情页并立即处理
-            console.log(`🔍 [消费者${id}] 开始爬取: ${moewallsId}`)
-            const wallpaper = await this.fetchDetailPage(url)
-
-            // 4. 立即处理并插入数据库
-            console.log(`💾 [消费者${id}] 处理并插入: ${wallpaper.name}`)
-            const result = await this.processWallpaper(wallpaper)
-
-            if (result === 'new') stats.newCount++
-            if (result === 'updated') stats.updatedCount++
-
-            console.log(
-              `✅ [消费者${id}] 完成: ${wallpaper.name} (${result}) - 已处理: ${processedCount}, 统计: 新增 ${stats.newCount}, 更新 ${stats.updatedCount}, 跳过 ${stats.skippedCount}`,
-            )
-          } catch (error) {
-            stats.failedCount++
-            console.error(`❌ [消费者${id}] 处理失败 (已处理: ${processedCount}):`, error)
-            // 继续处理下一个 URL，不要退出循环
+            // 页面处理完毕,清理引用
+            urls.length = 0
           }
+
+          page++
+          await this.delay(2000) // 页面间隔 2 秒
+        } catch (error) {
+          console.error(`❌ [第 ${page} 页] 爬取失败:`, error)
+          emptyCount++
         }
-
-        console.log(`🏁 [消费者${id}] 完成,共处理 ${processedCount} 个 URL`)
       }
-
-      // 启动生产者和多个消费者
-      await Promise.all([
-        producer,
-        ...Array.from({ length: this.CONSUMER_COUNT }, (_, i) => createConsumer(i + 1)),
-      ])
-
-      console.log(`📊 [爬虫] 生产者和所有消费者已完成`)
-      console.log(`📊 [队列状态] 剩余 URL: ${urlQueue.length}`)
 
       const statusMsg = this.abortController?.signal.aborted ? '\n🛑 爬取已终止' : '\n🎉 爬取完成'
       console.log(
