@@ -15,6 +15,18 @@ export class CrawlerService {
   private readonly CONSUMER_COUNT = 3 // 并发消费者数量
   private readonly BATCH_INSERT_SIZE = 10 // 批量插入大小
 
+  // 终止信号
+  private abortController: AbortController | null = null
+  private isRunning = false
+
+  // AI 请求限速 (1秒/请求)
+  private lastAiRequestTime = 0
+  private readonly AI_REQUEST_INTERVAL = 1000 // 1秒
+
+  // API Key 熔断机制
+  private readonly keyCircuitBreaker = new Map<string, number>() // key -> 熔断解除时间戳
+  private readonly CIRCUIT_BREAK_DURATION = 60 * 1000 // 熔断时长: 1分钟
+
   constructor() {
     // 从环境变量读取多个 Gemini API Keys (逗号分隔)
     const keysEnv = Deno.env.get('GEMINI_API_KEYS')
@@ -31,21 +43,70 @@ export class CrawlerService {
   }
 
   /**
-   * 轮询获取下一个 API Key
+   * 轮询获取下一个可用的 API Key (跳过熔断中的 Key)
    */
   private getNextApiKey(): string | null {
     if (this.AI_API_KEYS.length === 0) return null
 
-    const key = this.AI_API_KEYS[this.currentKeyIndex]
-    this.currentKeyIndex = (this.currentKeyIndex + 1) % this.AI_API_KEYS.length
+    const now = Date.now()
+    let attempts = 0
 
-    return key
+    // 尝试找到一个未被熔断的 Key
+    while (attempts < this.AI_API_KEYS.length) {
+      const key = this.AI_API_KEYS[this.currentKeyIndex]
+      const breakUntil = this.keyCircuitBreaker.get(key)
+
+      // 检查熔断状态
+      if (!breakUntil || now >= breakUntil) {
+        // Key 可用或熔断已解除
+        if (breakUntil && now >= breakUntil) {
+          this.keyCircuitBreaker.delete(key) // 清除熔断记录
+          console.log(`🔓 [熔断恢复] Key ${this.maskApiKey(key)} 已恢复可用`)
+        }
+
+        // 轮转到下一个 Key
+        this.currentKeyIndex = (this.currentKeyIndex + 1) % this.AI_API_KEYS.length
+        return key
+      }
+
+      // 当前 Key 被熔断,尝试下一个
+      this.currentKeyIndex = (this.currentKeyIndex + 1) % this.AI_API_KEYS.length
+      attempts++
+    }
+
+    // 所有 Key 都被熔断
+    console.error('❌ [熔断] 所有 API Keys 都已熔断')
+    return null
+  }
+
+  /**
+   * 触发 API Key 熔断
+   */
+  private circuitBreakKey(key: string): void {
+    const breakUntil = Date.now() + this.CIRCUIT_BREAK_DURATION
+    this.keyCircuitBreaker.set(key, breakUntil)
+    console.warn(
+      `🔒 [熔断] Key ${this.maskApiKey(key)} 已熔断 ${this.CIRCUIT_BREAK_DURATION / 1000} 秒`,
+    )
+  }
+
+  /**
+   * 脱敏显示 API Key (仅显示前6位)
+   */
+  private maskApiKey(key: string): string {
+    return key.substring(0, 6) + '***'
   }
 
   /**
    * 执行爬取任务 (生产者-消费者模式)
    */
   async crawl(): Promise<{ new_count: number; updated_count: number; failed_count: number }> {
+    if (this.isRunning) {
+      throw new Error('已有爬取任务正在运行')
+    }
+
+    this.isRunning = true
+    this.abortController = new AbortController()
     console.log('🕷️ 开始爬取 moewalls.com (生产者-消费者模式)...')
 
     const stats = { newCount: 0, updatedCount: 0, failedCount: 0, skippedCount: 0 }
@@ -53,118 +114,158 @@ export class CrawlerService {
     let producerDone = false // 生产者是否完成
     const processedBatch: MoewallsRawData[] = [] // 待插入批次
 
-    // 🔧 生产者: 持续爬取列表页,将 URL 放入队列
-    const producer = (async () => {
-      let page = 1
-      let emptyCount = 0 // 连续空页数
+    try {
+      // 🔧 生产者: 持续爬取列表页,将 URL 放入队列
+      const producer = (async () => {
+        let page = 1
+        let emptyCount = 0 // 连续空页数
 
-      while (emptyCount < 3) { // 连续3页为空则停止
-        try {
-          console.log(`📄 [生产者] 爬取第 ${page} 页...`)
-          const urls = await this.fetchListPage(page)
-
-          if (urls.length === 0) {
-            emptyCount++
-            console.log(`⚠️ [生产者] 第 ${page} 页无数据 (连续空页: ${emptyCount}/3)`)
-          } else {
-            emptyCount = 0
-            urlQueue.push(...urls)
-            console.log(
-              `✅ [生产者] 第 ${page} 页获取 ${urls.length} 个URL (队列: ${urlQueue.length})`,
-            )
+        while (emptyCount < 3) { // 连续3页为空则停止
+          // 检查终止信号
+          if (this.abortController?.signal.aborted) {
+            console.log('🛑 [生产者] 检测到终止信号,停止爬取')
+            break
           }
 
-          page++
-          await this.delay(this.REQUEST_DELAY)
-        } catch (error) {
-          console.error(`❌ [生产者] 第 ${page} 页失败:`, error)
-          emptyCount++
-        }
-      }
+          try {
+            console.log(`📄 [生产者] 爬取第 ${page} 页...`)
+            const urls = await this.fetchListPage(page)
 
-      producerDone = true
-      console.log(
-        `🏁 [生产者] 完成,共收集 ${
-          urlQueue.length + stats.skippedCount + stats.newCount + stats.updatedCount
-        } 个URL`,
-      )
-    })()
+            if (urls.length === 0) {
+              emptyCount++
+              console.log(`⚠️ [生产者] 第 ${page} 页无数据 (连续空页: ${emptyCount}/3)`)
+            } else {
+              emptyCount = 0
+              urlQueue.push(...urls)
+              console.log(
+                `✅ [生产者] 第 ${page} 页获取 ${urls.length} 个URL (队列: ${urlQueue.length})`,
+              )
+            }
 
-    // 🔧 消费者: 从队列取 URL,爬取详情并处理
-    const createConsumer = async (id: number) => {
-      while (true) {
-        // 队列为空且生产者已完成,退出
-        if (urlQueue.length === 0 && producerDone) break
-
-        // 队列为空但生产者未完成,等待
-        if (urlQueue.length === 0) {
-          await this.delay(500)
-          continue
+            page++
+            await this.delay(this.REQUEST_DELAY)
+          } catch (error) {
+            console.error(`❌ [生产者] 第 ${page} 页失败:`, error)
+            emptyCount++
+          }
         }
 
-        const url = urlQueue.shift()!
+        producerDone = true
+        console.log(
+          `🏁 [生产者] 完成,共收集 ${
+            urlQueue.length + stats.skippedCount + stats.newCount + stats.updatedCount
+          } 个URL`,
+        )
+      })()
 
-        try {
-          // 1. 提取 ID
-          const urlParts = url.replace(/\/$/, '').split('/')
-          const moewallsId = urlParts[urlParts.length - 1]
+      // 🔧 消费者: 从队列取 URL,爬取详情并处理
+      const createConsumer = async (id: number) => {
+        while (true) {
+          // 检查终止信号
+          if (this.abortController?.signal.aborted) {
+            console.log(`🛑 [消费者${id}] 检测到终止信号,停止工作`)
+            break
+          }
 
-          // 2. 查询数据库,已存在则跳过
-          const { data: existing } = await supabase
-            .from('wallpapers')
-            .select('id')
-            .eq('moewalls_id', moewallsId)
-            .maybeSingle()
+          // 队列为空且生产者已完成,退出
+          if (urlQueue.length === 0 && producerDone) break
 
-          if (existing) {
-            stats.skippedCount++
-            console.log(`⏭️ [消费者${id}] 已存在,跳过: ${moewallsId}`)
+          // 队列为空但生产者未完成,等待
+          if (urlQueue.length === 0) {
+            await this.delay(500)
             continue
           }
 
-          // 3. 爬取详情页
-          const wallpaper = await this.fetchDetailPage(url)
-          processedBatch.push(wallpaper)
+          const url = urlQueue.shift()!
 
-          console.log(
-            `✅ [消费者${id}] 爬取成功: ${wallpaper.name} (待插入: ${processedBatch.length})`,
-          )
+          try {
+            // 1. 提取 ID
+            const urlParts = url.replace(/\/$/, '').split('/')
+            const moewallsId = urlParts[urlParts.length - 1]
 
-          // 4. 批量插入数据库
-          if (processedBatch.length >= this.BATCH_INSERT_SIZE) {
-            await this.batchInsert(processedBatch, stats)
+            // 2. 查询数据库,已存在则跳过
+            const { data: existing } = await supabase
+              .from('wallpapers')
+              .select('id')
+              .eq('moewalls_id', moewallsId)
+              .maybeSingle()
+
+            if (existing) {
+              stats.skippedCount++
+              console.log(`⏭️ [消费者${id}] 已存在,跳过: ${moewallsId}`)
+              continue
+            }
+
+            // 3. 爬取详情页
+            const wallpaper = await this.fetchDetailPage(url)
+            processedBatch.push(wallpaper)
+
+            console.log(
+              `✅ [消费者${id}] 爬取成功: ${wallpaper.name} (待插入: ${processedBatch.length})`,
+            )
+
+            // 4. 批量插入数据库
+            if (processedBatch.length >= this.BATCH_INSERT_SIZE) {
+              await this.batchInsert(processedBatch, stats)
+            }
+
+            await this.delay(this.REQUEST_DELAY)
+          } catch (error) {
+            stats.failedCount++
+            console.error(`❌ [消费者${id}] 处理失败:`, error)
           }
-
-          await this.delay(this.REQUEST_DELAY)
-        } catch (error) {
-          stats.failedCount++
-          console.error(`❌ [消费者${id}] 处理失败:`, error)
         }
+
+        console.log(`🏁 [消费者${id}] 完成`)
       }
 
-      console.log(`🏁 [消费者${id}] 完成`)
+      // 启动生产者和多个消费者
+      await Promise.all([
+        producer,
+        ...Array.from({ length: this.CONSUMER_COUNT }, (_, i) => createConsumer(i + 1)),
+      ])
+
+      // 插入剩余数据
+      if (processedBatch.length > 0) {
+        await this.batchInsert(processedBatch, stats)
+      }
+
+      const statusMsg = this.abortController?.signal.aborted
+        ? '\n🛑 爬取已终止'
+        : '\n🎉 爬取完成'
+      console.log(
+        `${statusMsg}: 新增 ${stats.newCount}, 更新 ${stats.updatedCount}, 跳过 ${stats.skippedCount}, 失败 ${stats.failedCount}`,
+      )
+
+      return {
+        new_count: stats.newCount,
+        updated_count: stats.updatedCount,
+        failed_count: stats.failedCount,
+      }
+    } finally {
+      this.isRunning = false
+      this.abortController = null
+    }
+  }
+
+  /**
+   * 终止正在运行的爬取任务
+   */
+  abort(): boolean {
+    if (!this.isRunning || !this.abortController) {
+      return false
     }
 
-    // 启动生产者和多个消费者
-    await Promise.all([
-      producer,
-      ...Array.from({ length: this.CONSUMER_COUNT }, (_, i) => createConsumer(i + 1)),
-    ])
+    console.log('🛑 收到终止请求,正在停止爬取任务...')
+    this.abortController.abort()
+    return true
+  }
 
-    // 插入剩余数据
-    if (processedBatch.length > 0) {
-      await this.batchInsert(processedBatch, stats)
-    }
-
-    console.log(
-      `\n🎉 爬取完成: 新增 ${stats.newCount}, 更新 ${stats.updatedCount}, 跳过 ${stats.skippedCount}, 失败 ${stats.failedCount}`,
-    )
-
-    return {
-      new_count: stats.newCount,
-      updated_count: stats.updatedCount,
-      failed_count: stats.failedCount,
-    }
+  /**
+   * 检查是否有任务正在运行
+   */
+  getStatus(): { isRunning: boolean } {
+    return { isRunning: this.isRunning }
   }
 
   /**
@@ -426,21 +527,24 @@ export class CrawlerService {
   }
 
   /**
-   * 使用 Gemini AI 生成描述 (带重试和 key 轮询)
+   * 使用 Gemini AI 生成描述 (带重试、Key 轮询和熔断)
    */
   private async generateDescription(
     name: string,
     tags: string[],
   ): Promise<string> {
-    const maxAttempts = 2
+    const maxAttempts = Math.min(this.AI_API_KEYS.length, 3) // 最多尝试3次或所有Key数
     let lastError: Error | null = null
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      // 轮询获取下一个 API Key
+      // 轮询获取下一个可用的 API Key (自动跳过熔断的 Key)
       const apiKey = this.getNextApiKey()
       if (!apiKey) {
-        throw new Error('没有可用的 Gemini API Key')
+        throw new Error('没有可用的 Gemini API Key (可能全部被熔断)')
       }
+
+      // AI 请求限速: 确保与上次请求间隔至少 1 秒
+      await this.throttleAiRequest()
 
       const controller = new AbortController()
       const timeoutId = setTimeout(() => controller.abort(), 15000) // 15s 超时
@@ -480,9 +584,17 @@ export class CrawlerService {
 
         clearTimeout(timeoutId)
 
+        // 检查 HTTP 错误
         if (!response.ok) {
           const errorBody = await response.text().catch(() => 'unknown error')
-          throw new Error(`Gemini API 错误 ${response.status}: ${errorBody}`)
+          const error = new Error(`Gemini API 错误 ${response.status}: ${errorBody}`)
+
+          // 429 (配额超限) 或 401 (Key 无效) 触发熔断
+          if (response.status === 429 || response.status === 401) {
+            this.circuitBreakKey(apiKey)
+          }
+
+          throw error
         }
 
         const result = await response.json()
@@ -492,14 +604,20 @@ export class CrawlerService {
           throw new Error('Gemini 返回内容为空')
         }
 
+        // 成功返回
         return description
       } catch (error) {
         clearTimeout(timeoutId)
         lastError = error instanceof Error ? error : new Error(String(error))
 
+        // 记录错误并准备重试
+        console.warn(
+          `⚠️ [Gemini] Key ${this.maskApiKey(apiKey)} 失败 (${attempt}/${maxAttempts}): ${lastError.message}`,
+        )
+
+        // 如果还有重试机会,继续下一次尝试(将自动轮换 Key)
         if (attempt < maxAttempts) {
-          console.warn(`⚠️ [Gemini] 尝试 ${attempt}/${maxAttempts} 失败,切换 Key 重试...`)
-          await this.delay(1000)
+          await this.delay(500) // 短暂延迟后重试
         }
       }
     }
@@ -591,5 +709,20 @@ export class CrawlerService {
    */
   private delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
+  }
+
+  /**
+   * AI 请求限速: 确保请求间隔至少 1 秒
+   */
+  private async throttleAiRequest(): Promise<void> {
+    const now = Date.now()
+    const timeSinceLastRequest = now - this.lastAiRequestTime
+
+    if (timeSinceLastRequest < this.AI_REQUEST_INTERVAL) {
+      const waitTime = this.AI_REQUEST_INTERVAL - timeSinceLastRequest
+      await this.delay(waitTime)
+    }
+
+    this.lastAiRequestTime = Date.now()
   }
 }

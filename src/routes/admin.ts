@@ -6,9 +6,6 @@ import { adminRateLimiter, ApiError } from '../utils/validation.ts'
 const router = new Hono()
 const crawler = new CrawlerService()
 
-// 存储运行中的爬取任务
-const runningCrawls = new Set<string>()
-
 /**
  * 认证中间件
  */
@@ -39,12 +36,10 @@ router.use('*', async (c, next) => {
 router.post(
   '/crawl',
   asyncHandler(async (c) => {
-    if (runningCrawls.size > 0) {
+    const status = crawler.getStatus()
+    if (status.isRunning) {
       throw new ApiError(409, '已有爬取任务正在运行,请等待完成', 'CRAWL_IN_PROGRESS')
     }
-
-    const taskId = crypto.randomUUID()
-    runningCrawls.add(taskId)
 
     console.log('📥 收到手动爬取请求')
 
@@ -57,14 +52,44 @@ router.post(
       .catch((error) => {
         console.error('❌ 爬取任务失败:', error)
       })
-      .finally(() => {
-        runningCrawls.delete(taskId)
-      })
 
     return c.json({
       success: true,
       message: '爬取任务已启动',
-      taskId,
+    })
+  }),
+)
+
+/**
+ * 终止正在运行的爬取任务
+ */
+router.post(
+  '/crawl/abort',
+  asyncHandler(async (c) => {
+    const aborted = crawler.abort()
+
+    if (!aborted) {
+      throw new ApiError(400, '没有正在运行的爬取任务', 'NO_RUNNING_TASK')
+    }
+
+    return c.json({
+      success: true,
+      message: '已发送终止信号,任务将在当前批次完成后停止',
+    })
+  }),
+)
+
+/**
+ * 查询爬取任务状态
+ */
+router.get(
+  '/crawl/status',
+  asyncHandler(async (c) => {
+    const status = crawler.getStatus()
+
+    return c.json({
+      success: true,
+      data: status,
     })
   }),
 )
