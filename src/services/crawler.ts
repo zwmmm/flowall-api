@@ -178,23 +178,31 @@ export class CrawlerService {
 
       // 🔧 消费者: 从队列取 URL,爬取详情并处理
       const createConsumer = async (id: number) => {
+        console.log(`🚀 [消费者${id}] 启动`)
+        let processedCount = 0
+
         while (true) {
           // 检查终止信号
           if (this.abortController?.signal.aborted) {
-            console.log(`🛑 [消费者${id}] 检测到终止信号,停止工作`)
+            console.log(`🛑 [消费者${id}] 检测到终止信号,停止工作 (已处理: ${processedCount})`)
             break
           }
 
           // 队列为空且生产者已完成,退出
-          if (urlQueue.length === 0 && producerDone) break
+          if (urlQueue.length === 0 && producerDone) {
+            console.log(`🏁 [消费者${id}] 队列已空且生产者完成,退出 (已处理: ${processedCount})`)
+            break
+          }
 
           // 队列为空但生产者未完成,等待
           if (urlQueue.length === 0) {
+            console.log(`⏳ [消费者${id}] 队列为空,等待生产者... (生产者状态: ${producerDone ? '已完成' : '进行中'})`)
             await this.delay(500)
             continue
           }
 
           const url = urlQueue.shift()!
+          processedCount++
 
           try {
             // 1. 提取 ID
@@ -210,31 +218,34 @@ export class CrawlerService {
 
             if (existing) {
               stats.skippedCount++
-              console.log(`⏭️ [消费者${id}] 已存在,跳过: ${moewallsId}`)
+              console.log(`⏭️ [消费者${id}] 已存在,跳过: ${moewallsId} (已处理: ${processedCount})`)
               continue
             }
 
             // 3. 爬取详情页
+            console.log(`🔍 [消费者${id}] 开始爬取: ${moewallsId}`)
             const wallpaper = await this.fetchDetailPage(url)
             processedBatch.push(wallpaper)
 
             console.log(
-              `✅ [消费者${id}] 爬取成功: ${wallpaper.name} (待插入: ${processedBatch.length})`,
+              `✅ [消费者${id}] 爬取成功: ${wallpaper.name} (待插入: ${processedBatch.length}, 已处理: ${processedCount})`,
             )
 
             // 4. 批量插入数据库
             if (processedBatch.length >= this.BATCH_INSERT_SIZE) {
+              console.log(`💾 [消费者${id}] 触发批量插入 (${processedBatch.length} 条)`)
               await this.batchInsert(processedBatch, stats)
             }
 
             await this.delay(this.REQUEST_DELAY)
           } catch (error) {
             stats.failedCount++
-            console.error(`❌ [消费者${id}] 处理失败:`, error)
+            console.error(`❌ [消费者${id}] 处理失败 (已处理: ${processedCount}):`, error)
+            // 继续处理下一个 URL，不要退出循环
           }
         }
 
-        console.log(`🏁 [消费者${id}] 完成`)
+        console.log(`🏁 [消费者${id}] 完成,共处理 ${processedCount} 个 URL`)
       }
 
       // 启动生产者和多个消费者
@@ -243,8 +254,13 @@ export class CrawlerService {
         ...Array.from({ length: this.CONSUMER_COUNT }, (_, i) => createConsumer(i + 1)),
       ])
 
+      console.log(`📊 [爬虫] 生产者和所有消费者已完成`)
+      console.log(`📊 [队列状态] 剩余 URL: ${urlQueue.length}`)
+      console.log(`📊 [批次状态] 待插入: ${processedBatch.length}`)
+
       // 插入剩余数据
       if (processedBatch.length > 0) {
+        console.log(`💾 [最终批次] 插入剩余 ${processedBatch.length} 条数据`)
         await this.batchInsert(processedBatch, stats)
       }
 
@@ -498,7 +514,7 @@ export class CrawlerService {
       .from('wallpapers')
       .select('id, description, name_zh, tags_zh')
       .eq('moewalls_id', raw.id)
-      .single()
+      .maybeSingle()
 
     // 2. 生成 AI 内容 (描述 + 翻译)，仅在不存在时调用
     let description = existing?.description
