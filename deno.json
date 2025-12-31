@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "exports": "./main.ts",
   "tasks": {
-    "dev": "deno run --allow-net --allow-env --allow-read --unstable-cron --env-file=.env --watch main.ts",
-    "start": "deno run --allow-net --allow-env --allow-read --unstable-cron main.ts",
-    "crawl": "deno run --allow-net --allow-env --allow-read --env-file=.env test_crawler.ts",
+    "dev": "deno run -A --unstable-cron --env-file=.env --watch main.ts",
+    "start": "deno run -A --unstable-cron main.ts",
+    "crawl": "deno run -A --env-file=.env test_crawler.ts",
     "check": "deno check main.ts",
     "fmt": "deno fmt",
     "lint": "deno lint"
@@ -16,7 +16,11 @@
     "@supabase/supabase-js": "npm:@supabase/supabase-js@^2.47.0"
   },
   "compilerOptions": {
-    "lib": ["deno.window", "dom", "deno.unstable"],
+    "lib": [
+      "deno.window",
+      "dom",
+      "deno.unstable"
+    ],
     "strict": true
   },
   "fmt": {
@@ -29,8 +33,12 @@
   },
   "lint": {
     "rules": {
-      "tags": ["recommended"],
-      "exclude": ["require-await"]
+      "tags": [
+        "recommended"
+      ],
+      "exclude": [
+        "require-await"
+      ]
     }
   }
 }
