@@ -581,7 +581,12 @@ export class CrawlerService {
     try {
       await this.throttleAiRequest()
 
-      const apiKey = this.AI_API_KEYS[this.currentKeyIndex]
+      const apiKey = this.getNextApiKey()
+      if (!apiKey) {
+        console.log('⚠️ 无可用的 API Key (全部熔断中)')
+        return fallback
+      }
+
       const prompt = `你是一个专业的壁纸描述生成助手。请根据以下壁纸信息生成中文内容：
 
 原始标题: ${name}
@@ -600,7 +605,7 @@ export class CrawlerService {
 3. tags_zh: 准确翻译所有标签`
 
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`,
+        `${this.AI_BASE_URL}/models/${this.AI_MODEL}:generateContent?key=${apiKey}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -617,6 +622,14 @@ export class CrawlerService {
       )
 
       if (!response.ok) {
+        const errorText = await response.text()
+        console.error(`❌ AI API 错误 (${response.status}): ${errorText}`)
+
+        // 触发熔断 (429: 配额超限, 403: API Key 无效)
+        if (response.status === 429 || response.status === 403) {
+          this.circuitBreakKey(apiKey)
+        }
+
         throw new Error(`API error: ${response.status}`)
       }
 
