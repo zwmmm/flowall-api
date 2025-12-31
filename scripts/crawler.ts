@@ -12,10 +12,10 @@ if (!ADMIN_API_KEY) {
 
 async function triggerCrawl() {
   console.log('📡 正在调用生产环境 crawler API...')
-  console.log(`🌐 目标地址: ${PRODUCTION_URL}/admin/crawl`)
+  console.log(`🌐 目标地址: ${PRODUCTION_URL}/api/v1/admin/crawl`)
 
   try {
-    const response = await fetch(`${PRODUCTION_URL}/admin/crawl`, {
+    const response = await fetch(`${PRODUCTION_URL}/api/v1/admin/crawl`, {
       method: 'POST',
       headers: {
         'X-API-Key': ADMIN_API_KEY!,

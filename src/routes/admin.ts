@@ -12,7 +12,7 @@ const runningCrawls = new Set<string>()
 /**
  * 认证中间件
  */
-router.use('/*', async (c, next) => {
+router.use('*', async (c, next) => {
   const apiKey = c.req.header('X-API-Key')
   const validKey = Deno.env.get('ADMIN_API_KEY')
 
