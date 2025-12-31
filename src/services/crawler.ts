@@ -552,15 +552,16 @@ export class CrawlerService {
 
     // 重试逻辑: 最多尝试所有可用的 API Keys
     let lastError: Error | null = null
+    const maxAttempts = Math.max(this.AI_API_KEYS.length, 1) // 至少尝试 1 次
 
-    for (let attempt = 0; attempt < this.AI_API_KEYS.length; attempt++) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         await this.throttleAiRequest()
 
         const apiKey = this.getNextApiKey()
         if (!apiKey) {
-          console.log('⚠️ 无可用的 API Key (全部熔断中)')
-          break
+          console.log('⚠️ 无可用的 API Key (全部熔断中或未配置)，使用降级策略')
+          break // 直接退出，返回 fallback
         }
 
         const response = await fetch(
