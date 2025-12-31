@@ -96,12 +96,22 @@ if (enableScheduler) {
   console.log('⚠️ 定时任务已禁用')
 }
 
-// 优雅关闭
-Deno.addSignalListener('SIGINT', () => {
-  console.log('\n👋 正在关闭服务...')
+// 优雅关闭处理
+// 后台运行时忽略 SIGINT(Ctrl+C),只响应 SIGTERM(kill 命令)
+Deno.addSignalListener('SIGTERM', () => {
+  console.log('\n👋 收到关闭信号,正在优雅关闭服务...')
   scheduler.stop()
   Deno.exit(0)
 })
+
+// 如果是前台运行(开发模式),也支持 Ctrl+C 关闭
+if (Deno.stdin.isTerminal()) {
+  Deno.addSignalListener('SIGINT', () => {
+    console.log('\n👋 收到中断信号,正在关闭服务...')
+    scheduler.stop()
+    Deno.exit(0)
+  })
+}
 
 // 启动服务器
 const port = Number(Deno.env.get('PORT')) || 8000
