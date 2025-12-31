@@ -1,0 +1,36 @@
+{
+  "name": "@flowall/api",
+  "version": "0.1.0",
+  "exports": "./main.ts",
+  "tasks": {
+    "dev": "deno run --allow-net --allow-env --allow-read --unstable-cron --env-file=.env --watch main.ts",
+    "start": "deno run --allow-net --allow-env --allow-read --unstable-cron main.ts",
+    "crawl": "deno run --allow-net --allow-env --allow-read --env-file=.env test_crawler.ts",
+    "check": "deno check main.ts",
+    "fmt": "deno fmt",
+    "lint": "deno lint"
+  },
+  "imports": {
+    "hono": "jsr:@hono/hono@^4.7.9",
+    "hono/": "jsr:@hono/hono@^4.7.9/",
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@^2.47.0"
+  },
+  "compilerOptions": {
+    "lib": ["deno.window", "dom", "deno.unstable"],
+    "strict": true
+  },
+  "fmt": {
+    "useTabs": false,
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "semiColons": false,
+    "singleQuote": true,
+    "proseWrap": "preserve"
+  },
+  "lint": {
+    "rules": {
+      "tags": ["recommended"],
+      "exclude": ["require-await"]
+    }
+  }
+}
