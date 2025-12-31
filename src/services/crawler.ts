@@ -202,8 +202,16 @@ export class CrawlerService {
               }
             }
 
-            // 页面处理完毕,清理引用
+            // 页面处理完毕,清理引用释放内存
             urls.length = 0
+
+            // 输出内存使用情况 (如果可用)
+            if (typeof Deno !== 'undefined' && Deno.memoryUsage) {
+              const mem = Deno.memoryUsage()
+              console.log(
+                `💾 [内存] 堆: ${(mem.heapUsed / 1024 / 1024).toFixed(2)}MB / ${(mem.heapTotal / 1024 / 1024).toFixed(2)}MB`,
+              )
+            }
           }
 
           page++
@@ -323,6 +331,10 @@ export class CrawlerService {
         }
       })
 
+      // 释放 Cheerio 占用的内存
+      // @ts-ignore - Cheerio 内部清理
+      $.root().empty()
+
       return urls
     } catch (error) {
       clearTimeout(timeoutId)
@@ -402,6 +414,10 @@ export class CrawlerService {
         const tag = $(el).text().trim()
         if (tag) tags.push(tag)
       })
+
+      // 释放 Cheerio 占用的内存
+      // @ts-ignore - Cheerio 内部清理
+      $.root().empty()
 
       return {
         id,
