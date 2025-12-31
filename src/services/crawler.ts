@@ -248,9 +248,7 @@ export class CrawlerService {
         await this.batchInsert(processedBatch, stats)
       }
 
-      const statusMsg = this.abortController?.signal.aborted
-        ? '\n🛑 爬取已终止'
-        : '\n🎉 爬取完成'
+      const statusMsg = this.abortController?.signal.aborted ? '\n🛑 爬取已终止' : '\n🎉 爬取完成'
       console.log(
         `${statusMsg}: 新增 ${stats.newCount}, 更新 ${stats.updatedCount}, 跳过 ${stats.skippedCount}, 失败 ${stats.failedCount}`,
       )
@@ -502,23 +500,19 @@ export class CrawlerService {
       .eq('moewalls_id', raw.id)
       .single()
 
-    // 2. 生成 AI 描述
+    // 2. 生成 AI 内容 (描述 + 翻译)，仅在不存在时调用
     let description = existing?.description
-    if (!description) {
-      description = await this.generateDescriptionWithRetry(raw.name, raw.tags)
-    }
-
-    // 3. 翻译 name 和 tags (仅在不存在时翻译)
     let name_zh = existing?.name_zh
     let tags_zh = existing?.tags_zh
 
-    if (!name_zh || !tags_zh || tags_zh.length === 0) {
-      const translation = await this.translateContent(raw.name, raw.tags)
-      name_zh = translation.name_zh || name_zh
-      tags_zh = translation.tags_zh || tags_zh
+    if (!description || !name_zh || !tags_zh || tags_zh.length === 0) {
+      const aiContent = await this.generateAIContent(raw.name, raw.tags)
+      description = aiContent.description || description
+      name_zh = aiContent.name_zh || name_zh
+      tags_zh = aiContent.tags_zh || tags_zh
     }
 
-    // 4. 准备数据
+    // 3. 准备数据
     const wallpaperData: Partial<Wallpaper> = {
       moewalls_id: raw.id,
       name: raw.name,
@@ -553,183 +547,57 @@ export class CrawlerService {
       wallpaperId = data.id
     }
 
-    // 5. 处理标签 (包含中文翻译)
+    // 4. 处理标签 (包含中文翻译)
     await this.processTags(wallpaperId, raw.tags, tags_zh)
 
     return existing ? 'updated' : 'new'
   }
 
   /**
-   * 生成描述 (带异常隔离)
-   * AI 调用失败不影响主流程,自动降级为默认格式
+   * 生成 AI 内容 (描述 + 中文翻译) - 合并为一次调用
+   * 返回结构化 JSON 数据
    */
-  private async generateDescriptionWithRetry(
+  private async generateAIContent(
     name: string,
     tags: string[],
-  ): Promise<string> {
-    // 降级策略: 未配置 AI 或调用失败时使用默认格式
-    const fallbackDescription = `${name} - ${tags.join(', ')}`
+  ): Promise<{
+    description?: string
+    name_zh?: string
+    tags_zh?: string[]
+  }> {
+    // 降级策略
+    const fallback = {
+      description: `${name} - ${tags.join(', ')}`,
+      name_zh: undefined,
+      tags_zh: undefined,
+    }
 
-    // 未配置 Gemini API Keys,直接返回默认格式
+    // 未配置 Gemini API Keys
     if (this.AI_API_KEYS.length === 0) {
-      return fallbackDescription
-    }
-
-    // 尝试调用 Gemini (最多2次)
-    try {
-      return await this.generateDescription(name, tags)
-    } catch (error) {
-      // AI 调用失败,记录日志但不抛出异常
-      console.warn(
-        `⚠️ [Gemini] 描述生成失败,使用默认格式:`,
-        error instanceof Error ? error.message : error,
-      )
-      return fallbackDescription
-    }
-  }
-
-  /**
-   * 使用 Gemini AI 生成描述 (带重试、Key 轮询和熔断)
-   */
-  private async generateDescription(
-    name: string,
-    tags: string[],
-  ): Promise<string> {
-    const maxAttempts = Math.min(this.AI_API_KEYS.length, 3) // 最多尝试3次或所有Key数
-    let lastError: Error | null = null
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      // 轮询获取下一个可用的 API Key (自动跳过熔断的 Key)
-      const apiKey = this.getNextApiKey()
-      if (!apiKey) {
-        throw new Error('没有可用的 Gemini API Key (可能全部被熔断)')
-      }
-
-      // AI 请求限速: 确保与上次请求间隔至少 1 秒
-      await this.throttleAiRequest()
-
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 15000) // 15s 超时
-
-      try {
-        const prompt = `请将以下壁纸信息转换为简洁的中文描述,用于搜索匹配:
-名称: ${name}
-标签: ${tags.join(', ')}
-
-要求:
-1. 翻译成中文
-2. 描述风格、主题、特点
-3. 控制在 50 字以内
-4. 只返回描述文本,无需其他说明`
-
-        // Gemini API endpoint (使用配置的代理和模型)
-        const apiUrl = `${this.AI_BASE_URL}/models/${this.AI_MODEL}:generateContent?key=${apiKey}`
-
-        const response = await fetch(apiUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            contents: [{
-              parts: [{
-                text: prompt,
-              }],
-            }],
-            generationConfig: {
-              temperature: 0.7,
-              maxOutputTokens: 200,
-            },
-          }),
-          signal: controller.signal,
-        })
-
-        clearTimeout(timeoutId)
-
-        // 检查 HTTP 错误
-        if (!response.ok) {
-          const errorBody = await response.text().catch(() => 'unknown error')
-          const error = new Error(`Gemini API 错误 ${response.status}: ${errorBody}`)
-
-          // 429 (配额超限) 或 401 (Key 无效) 触发熔断
-          if (response.status === 429 || response.status === 401) {
-            this.circuitBreakKey(apiKey)
-          }
-
-          throw error
-        }
-
-        const result = await response.json()
-        const description = result.candidates?.[0]?.content?.parts?.[0]?.text?.trim()
-
-        if (!description) {
-          throw new Error('Gemini 返回内容为空')
-        }
-
-        // 成功返回
-        return description
-      } catch (error) {
-        clearTimeout(timeoutId)
-        lastError = error instanceof Error ? error : new Error(String(error))
-
-        // 记录错误并准备重试
-        console.warn(
-          `⚠️ [Gemini] Key ${this.maskApiKey(apiKey)} 失败 (${attempt}/${maxAttempts}): ${lastError.message}`,
-        )
-
-        // 如果还有重试机会,继续下一次尝试(将自动轮换 Key)
-        if (attempt < maxAttempts) {
-          await this.delay(500) // 短暂延迟后重试
-        }
-      }
-    }
-
-    throw lastError || new Error('Gemini 调用失败')
-  }
-
-  /**
-   * 处理标签: 直接更新 wallpapers 表的 tags 和 tags_zh 字段
-   */
-  private async processTags(wallpaperId: string, tagNames: string[], tagsZh?: string[] | null) {
-    const { error } = await supabase
-      .from('wallpapers')
-      .update({
-        tags: tagNames,
-        tags_zh: tagsZh || []
-      })
-      .eq('id', wallpaperId)
-
-    if (error) {
-      console.error('更新标签失败:', error)
-    }
-  }
-
-  /**
-   * 翻译内容 (name 和 tags)
-   * 使用 Gemini API 进行翻译，失败时返回空
-   */
-  private async translateContent(
-    name: string,
-    tags: string[],
-  ): Promise<{ name_zh?: string; tags_zh?: string[] }> {
-    // 未配置 Gemini API Keys，跳过翻译
-    if (this.AI_API_KEYS.length === 0) {
-      console.log('⚠️ 未配置 AI API，跳过翻译')
-      return {}
+      console.log('⚠️ 未配置 AI API，使用默认描述')
+      return fallback
     }
 
     try {
       await this.throttleAiRequest()
 
       const apiKey = this.AI_API_KEYS[this.currentKeyIndex]
-      const prompt = `请将以下英文内容翻译成简体中文，只返回翻译结果，不要任何解释：
+      const prompt = `你是一个专业的壁纸描述生成助手。请根据以下壁纸信息生成中文内容：
 
-标题: ${name}
+原始标题: ${name}
 标签: ${tags.join(', ')}
 
-请按照以下格式返回（每行一个）：
-标题翻译
-标签1,标签2,标签3`
+请返回 JSON 格式（不要包含 markdown 代码块标记）：
+{
+  "name_zh": "中文标题翻译",
+  "description": "面向搜索的生动描述，突出壁纸特点和视觉效果。",
+  "tags_zh": ["中文标签1", "中文标签2", ...]
+}
+
+要求：
+1. name_zh: 简洁优雅的中文标题
+2. description: 生动形象的描述，吸引用户
+3. tags_zh: 准确翻译所有标签`
 
       const response = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`,
@@ -741,8 +609,8 @@ export class CrawlerService {
               parts: [{ text: prompt }],
             }],
             generationConfig: {
-              temperature: 0.3,
-              maxOutputTokens: 200,
+              temperature: 0.7,
+              maxOutputTokens: 500,
             },
           }),
         },
@@ -756,18 +624,40 @@ export class CrawlerService {
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim()
 
       if (text) {
-        const lines = text.split('\n').filter((line: string) => line.trim())
-        const name_zh = lines[0]?.trim()
-        const tags_zh = lines[1]?.split(',').map((t: string) => t.trim()).filter((t: string) => t)
+        // 清理可能的 markdown 代码块标记
+        const cleanedText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
+        const result = JSON.parse(cleanedText)
 
-        console.log(`✅ 翻译成功: ${name} → ${name_zh}`)
-        return { name_zh, tags_zh }
+        console.log(`✅ AI 内容生成成功: ${name} → ${result.name_zh}`)
+
+        return {
+          description: result.description || fallback.description,
+          name_zh: result.name_zh,
+          tags_zh: Array.isArray(result.tags_zh) ? result.tags_zh : undefined,
+        }
       }
 
-      return {}
+      return fallback
     } catch (error) {
-      console.error('❌ 翻译失败:', error)
-      return {}
+      console.error('❌ AI 内容生成失败:', error)
+      return fallback
+    }
+  }
+
+  /**
+   * 处理标签: 直接更新 wallpapers 表的 tags 和 tags_zh 字段
+   */
+  private async processTags(wallpaperId: string, tagNames: string[], tagsZh?: string[] | null) {
+    const { error } = await supabase
+      .from('wallpapers')
+      .update({
+        tags: tagNames,
+        tags_zh: tagsZh || [],
+      })
+      .eq('id', wallpaperId)
+
+    if (error) {
+      console.error('更新标签失败:', error)
     }
   }
 
