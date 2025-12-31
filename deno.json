@@ -3,14 +3,15 @@
   "version": "0.1.0",
   "exports": "./main.ts",
   "tasks": {
-    "dev": "deno run -A --unstable-cron --env-file=.env --watch main.ts",
-    "start": "deno run -A --unstable-cron main.ts",
+    "dev": "deno run -A --env-file=.env --watch main.ts",
+    "start": "deno run -A main.ts",
     "crawl": "deno run -A --env-file=.env test_crawler.ts"
   },
   "imports": {
     "hono": "jsr:@hono/hono@^4.7.9",
     "hono/": "jsr:@hono/hono@^4.7.9/",
-    "@supabase/supabase-js": "npm:@supabase/supabase-js@^2.47.0"
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@^2.47.0",
+    "deno-cron": "https://deno.land/x/deno_cron@v1.0.0/cron.ts"
   },
   "compilerOptions": {
     "lib": [

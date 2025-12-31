@@ -1,7 +1,8 @@
+import { cron, start, stop } from 'deno-cron'
 import { CrawlerService } from './services/crawler.ts'
 
 /**
- * 定时任务调度器 (基于 Deno.cron)
+ * 定时任务调度器 (基于 deno-cron)
  * 每天执行一次爬取任务
  */
 export class Scheduler {
@@ -25,11 +26,11 @@ export class Scheduler {
 
     this.isRunning = true
 
-    // 使用 Deno.cron 启动定时任务
-    // cron 格式: 分 时 日 月 周
-    const cronExpression = `${minute} ${hour} * * *`
+    // 使用 deno-cron 注册定时任务
+    // cron 格式: 秒 分 时 日 月 周
+    const cronExpression = `0 ${minute} ${hour} * * *`
 
-    Deno.cron('Daily Wallpaper Crawler', cronExpression, async () => {
+    cron(cronExpression, async () => {
       console.log('🚀 开始执行定时爬取任务...')
 
       try {
@@ -40,16 +41,25 @@ export class Scheduler {
       }
     })
 
-    console.log(`⏰ 定时任务已启动: 每天 ${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')} 执行爬取`)
+    // 启动 cron 调度器
+    start()
+
+    console.log(
+      `⏰ 定时任务已启动: 每天 ${hour.toString().padStart(2, '0')}:${
+        minute.toString().padStart(2, '0')
+      } 执行爬取`,
+    )
   }
 
   /**
    * 停止定时任务
-   * 注意: Deno.cron 无法手动停止,只能通过重启进程
    */
   stop() {
-    this.isRunning = false
-    console.log('🛑 定时任务停止 (Deno.cron 将在进程退出时自动停止)')
+    if (this.isRunning) {
+      stop()
+      this.isRunning = false
+      console.log('🛑 定时任务已停止')
+    }
   }
 
   /**
