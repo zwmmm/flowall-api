@@ -2,7 +2,7 @@
  * 调用生产环境 crawler API
  */
 
-const PRODUCTION_URL = 'https://flowall-api.sanyi.deno.net'
+const PRODUCTION_URL = 'http://localhost:8000'
 const ADMIN_API_KEY = Deno.env.get('ADMIN_API_KEY')
 
 if (!ADMIN_API_KEY) {

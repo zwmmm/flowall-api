@@ -86,14 +86,15 @@ app.onError((err, c) => {
   )
 })
 
-// 启动定时任务
-const enableScheduler = Deno.env.get('ENABLE_SCHEDULER') !== 'false'
+// 启动定时任务 (默认关闭，需要环境变量 ENABLE_SCHEDULER=true 开启)
+const enableScheduler = Deno.env.get('ENABLE_SCHEDULER') === 'true'
 if (enableScheduler) {
   const scheduleHour = Number(Deno.env.get('SCHEDULE_HOUR')) || 2
   const scheduleMinute = Number(Deno.env.get('SCHEDULE_MINUTE')) || 0
   scheduler.start(scheduleHour, scheduleMinute)
+  console.log(`⏰ 定时任务已启动: 每天 ${scheduleHour.toString().padStart(2, '0')}:${scheduleMinute.toString().padStart(2, '0')}`)
 } else {
-  console.log('⚠️ 定时任务已禁用')
+  console.log('⚠️ 定时任务已禁用 (设置 ENABLE_SCHEDULER=true 启用)')
 }
 
 // 优雅关闭处理
