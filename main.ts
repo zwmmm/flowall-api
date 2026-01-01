@@ -1,8 +1,8 @@
-import { Hono } from 'hono'
 import { createClient } from '@supabase/supabase-js'
+import { Hono } from 'hono'
+import { errorHandler } from './src/middleware/errorHandler.ts'
 import router from './src/routes/index.ts'
 import { scheduler } from './src/scheduler.ts'
-import { errorHandler } from './src/middleware/errorHandler.ts'
 import { ApiError } from './src/utils/validation.ts'
 
 // 初始化 Supabase 客户端
@@ -87,12 +87,16 @@ app.onError((err, c) => {
 })
 
 // 启动定时任务 (默认关闭，需要环境变量 ENABLE_SCHEDULER=true 开启)
-const enableScheduler = Deno.env.get('ENABLE_SCHEDULER') === 'true'
+const enableScheduler = false
 if (enableScheduler) {
   const scheduleHour = Number(Deno.env.get('SCHEDULE_HOUR')) || 2
   const scheduleMinute = Number(Deno.env.get('SCHEDULE_MINUTE')) || 0
   scheduler.start(scheduleHour, scheduleMinute)
-  console.log(`⏰ 定时任务已启动: 每天 ${scheduleHour.toString().padStart(2, '0')}:${scheduleMinute.toString().padStart(2, '0')}`)
+  console.log(
+    `⏰ 定时任务已启动: 每天 ${scheduleHour.toString().padStart(2, '0')}:${
+      scheduleMinute.toString().padStart(2, '0')
+    }`,
+  )
 } else {
   console.log('⚠️ 定时任务已禁用 (设置 ENABLE_SCHEDULER=true 启用)')
 }
